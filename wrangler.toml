@@ -1,9 +1,9 @@
-name = "vendyai-com-worker"
+name = "vendyai-com-worker-DEAD-UNUSED-do-not-deploy"
 main = "worker.js"
 compatibility_date = "2024-05-12"
 
 [env.production]
-name = "vendyai-com-worker"
+name = "vendyai-com-worker-DEAD-UNUSED-do-not-deploy"
 
 [[kv_namespaces]]
 binding = "VENDYAI_KV"
