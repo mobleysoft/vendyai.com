@@ -1,0 +1,15 @@
+name = "vendyai-com-worker-DEAD-UNUSED-do-not-deploy"
+main = "worker.js"
+compatibility_date = "2024-05-12"
+
+[env.production]
+name = "vendyai-com-worker-DEAD-UNUSED-do-not-deploy"
+
+[[kv_namespaces]]
+binding = "VENDYAI_KV"
+id = "c3cc5dea18c149348788e24a7ce14808"
+
+[vars]
+MAC_MINI_TUNNEL_URL = "https://core.jmobleyworks.com"
+# Stripe physical payment links can be overridden securely via Cloudflare Secrets
+# e.g., npx wrangler secret put STRIPE_LINK_LITERACRAFT

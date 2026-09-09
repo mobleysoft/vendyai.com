@@ -1,15 +1,18 @@
-name = "vendyai-com-worker-DEAD-UNUSED-do-not-deploy"
-main = "worker.js"
-compatibility_date = "2024-05-12"
+name = "vendyai-com-worker"
+main = "src/worker.js"
+compatibility_date = "2026-09-03"
+account_id = "f07be5f84583d0d100b05aeeae56870b"
+workers_dev = true
 
-[env.production]
-name = "vendyai-com-worker-DEAD-UNUSED-do-not-deploy"
+[[d1_databases]]
+binding = "DB"
+database_name = "vendyai_ledger"
+database_id = "1ed761c2-9142-4d25-9f17-78fb9b63e74a"
 
-[[kv_namespaces]]
-binding = "VENDYAI_KV"
-id = "c3cc5dea18c149348788e24a7ce14808"
+[[routes]]
+pattern = "vendyai.com/*"
+zone_name = "vendyai.com"
 
-[vars]
-MAC_MINI_TUNNEL_URL = "https://core.jmobleyworks.com"
-# Stripe physical payment links can be overridden securely via Cloudflare Secrets
-# e.g., npx wrangler secret put STRIPE_LINK_LITERACRAFT
+[[routes]]
+pattern = "www.vendyai.com/*"
+zone_name = "vendyai.com"
