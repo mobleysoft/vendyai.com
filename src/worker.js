@@ -279,9 +279,24 @@ export default {
           console.error("[vendyai] fee capture failed for", session.id, ":", err.message);
         }
 
+        // Field names deliberately mirror Stripe's own checkout.session
+        // object for now (id, customer, mode, customer_details) so existing
+        // consumers (weylandai's webhook handler) need minimal changes to
+        // read this. This is a real, acknowledged debt: a provider-neutral
+        // wire format for this forward is the actual target (see
+        // VENDYAI_PROVIDER_ABSTRACTION.md) - deferred, not solved here,
+        // since redesigning the contract for all registered ventures is a
+        // bigger, separate change from making the flow work correctly.
         const forward = await forwardToVenture(env, ventureId, "checkout.session.completed", {
+          id: session.id,
+          mode: session.mode,
           metadata: session.metadata,
-          stripe_customer_id: session.customer,
+          customer: session.customer,
+          // Stripe includes customer_details (email/name/address) directly
+          // on checkout.session.completed by default, no expansion needed -
+          // forwarded here so every consuming venture doesn't have to make
+          // its own extra Stripe API call just to learn who paid.
+          customer_details: session.customer_details || null,
           amount_total: session.amount_total,
           currency: session.currency,
           stripe_fee_cents: feeCents,
