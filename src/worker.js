@@ -333,6 +333,127 @@ export default {
       return jsonResponse({ ok: true, venture_id }, 201);
     }
 
+    // Real first increment of VENDYAI_PROVIDER_ABSTRACTION.md's migration
+    // plan: a VendyAI-owned product catalog. A venture registers a product
+    // once and gets back a provider-neutral price_ref (vpr_...) instead of
+    // ever seeing a Stripe price id. Internally this still creates a real
+    // Stripe Product+Price (today's only provider) - the provider-interface
+    // refactor itself (swappable implementations behind one interface) is
+    // not built in this pass, only made possible without a rewrite later,
+    // per that document's own stated scope.
+    if (url.pathname === "/api/v2/products" && request.method === "POST") {
+      const adminSecret = request.headers.get("X-Admin-Secret");
+      if (!env.ADMIN_SECRET || adminSecret !== env.ADMIN_SECRET) {
+        return errorResponse("UNAUTHORIZED", "invalid admin secret", 401);
+      }
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return errorResponse("INVALID_JSON", "invalid JSON body");
+      }
+      const { venture_id, name, description, unit_amount_cents, currency, recurring_interval } = body || {};
+      if (!venture_id || !name || !Number.isInteger(unit_amount_cents) || unit_amount_cents <= 0) {
+        return errorResponse("VALIDATION_ERROR", "venture_id, name, and a positive integer unit_amount_cents are required");
+      }
+      const registration = await env.DB.prepare(
+        "SELECT venture_id FROM venture_webhook_endpoints WHERE venture_id = ?"
+      ).bind(venture_id).first();
+      if (!registration) {
+        return errorResponse("UNKNOWN_VENTURE", `venture_id "${venture_id}" is not registered - see POST /api/ventures/register`, 404);
+      }
+      const cur = (currency || "usd").toLowerCase();
+      try {
+        const product = await stripeRequest(env, "POST", "/products", { name, description: description || undefined });
+        const priceBody = {
+          product: product.id,
+          unit_amount: unit_amount_cents,
+          currency: cur,
+        };
+        if (recurring_interval) priceBody.recurring = { interval: recurring_interval };
+        const price = await stripeRequest(env, "POST", "/prices", priceBody);
+        const priceRef = `vpr_${crypto.randomUUID().replace(/-/g, "")}`;
+        await env.DB.prepare(
+          "INSERT INTO products (id, venture_id, name, description, unit_amount_cents, currency, recurring_interval, provider_price_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        ).bind(priceRef, venture_id, name, description || null, unit_amount_cents, cur, recurring_interval || null, price.id).run();
+        return jsonResponse({ product: { price_ref: priceRef, venture_id, name, unit_amount_cents, currency: cur, recurring_interval: recurring_interval || null } }, 201);
+      } catch (err) {
+        console.error("[vendyai] product registration failed:", err.message);
+        return errorResponse("STRIPE_ERROR", err.message, 502);
+      }
+    }
+
+    // Lists a venture's own active catalog - a venture only ever needs to
+    // know its own price_refs, never another venture's.
+    if (url.pathname === "/api/v2/products" && request.method === "GET") {
+      const ventureId = url.searchParams.get("venture_id");
+      if (!ventureId) return errorResponse("VALIDATION_ERROR", "venture_id query param is required", 400);
+      const rows = await env.DB.prepare(
+        "SELECT id AS price_ref, name, description, unit_amount_cents, currency, recurring_interval FROM products WHERE venture_id = ? AND active = 1 ORDER BY created_at DESC"
+      ).bind(ventureId).all();
+      return jsonResponse({ products: rows.results || [] });
+    }
+
+    // Provider-neutral checkout creation: callers pass price_refs
+    // (vpr_...), never a Stripe price id - the actual requirement named in
+    // VENDYAI_PROVIDER_ABSTRACTION.md ("consuming ventures should never be
+    // able to tell Stripe is what it depends on internally"). Additive
+    // alongside /api/checkout/sessions (unchanged, still real, still what
+    // weylandai's live integration uses today) - no existing consumer is
+    // touched by this route existing.
+    if (url.pathname === "/api/v2/checkout/sessions" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return errorResponse("INVALID_JSON", "invalid JSON body");
+      }
+      const { venture_id, mode, customer_email, success_url, cancel_url, price_refs, metadata } = body || {};
+      if (!venture_id || !success_url || !cancel_url || !Array.isArray(price_refs) || price_refs.length === 0) {
+        return errorResponse("VALIDATION_ERROR", "venture_id, success_url, cancel_url, and a non-empty price_refs array are required");
+      }
+      const registration = await env.DB.prepare(
+        "SELECT venture_id FROM venture_webhook_endpoints WHERE venture_id = ?"
+      ).bind(venture_id).first();
+      if (!registration) {
+        return errorResponse("UNKNOWN_VENTURE", `venture_id "${venture_id}" is not registered - see POST /api/ventures/register`, 404);
+      }
+
+      const lineItems = [];
+      for (const ref of price_refs) {
+        const priceRef = ref?.price_ref;
+        const quantity = Number.isInteger(ref?.quantity) && ref.quantity > 0 ? ref.quantity : 1;
+        if (!priceRef) {
+          return errorResponse("VALIDATION_ERROR", "each price_refs entry needs a price_ref", 400);
+        }
+        const product = await env.DB.prepare(
+          "SELECT provider_price_id FROM products WHERE id = ? AND venture_id = ? AND active = 1"
+        ).bind(priceRef, venture_id).first();
+        if (!product) {
+          return errorResponse("UNKNOWN_PRICE_REF", `price_ref "${priceRef}" is not a registered, active product for venture_id "${venture_id}"`, 404);
+        }
+        lineItems.push({ price: product.provider_price_id, quantity });
+      }
+
+      try {
+        const session = await stripeRequest(env, "POST", "/checkout/sessions", {
+          mode: mode || "payment",
+          customer_email,
+          success_url,
+          cancel_url,
+          line_items: lineItems,
+          metadata: { ...metadata, venture_id },
+        });
+        await env.DB.prepare(
+          "INSERT INTO checkout_sessions (id, venture_id, stripe_session_id, status, amount_total, currency, api_version) VALUES (?, ?, ?, ?, ?, ?, 'v2')"
+        ).bind(crypto.randomUUID(), venture_id, session.id, session.status || "open", session.amount_total ?? null, session.currency ?? null).run();
+        return jsonResponse({ session: { id: session.id, url: session.url } }, 201);
+      } catch (err) {
+        console.error("[vendyai] v2 checkout session creation failed:", err.message);
+        return errorResponse("STRIPE_ERROR", err.message, 502);
+      }
+    }
+
     if (url.pathname === "/" && request.method === "GET") {
       let ventureCount = null;
       try {
