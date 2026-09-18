@@ -15,6 +15,10 @@ function makeEnv() {
 function fakeStripeFetch() {
   const calls = [];
   let seq = 0;
+  const existingPrices = {
+    price_existing_live: { id: "price_existing_live", active: true, unit_amount: 29900, currency: "usd", recurring: { interval: "month" } },
+    price_existing_inactive: { id: "price_existing_inactive", active: false, unit_amount: 500, currency: "usd", recurring: null },
+  };
   return {
     calls,
     fetchImpl: async (url, opts) => {
@@ -22,6 +26,11 @@ function fakeStripeFetch() {
       const bodyStr = opts?.body || "";
       calls.push({ path, method: opts.method, bodyStr });
       seq += 1;
+      if (path.startsWith("/prices/") && (!opts.method || opts.method === "GET")) {
+        const priceId = path.slice("/prices/".length);
+        const price = existingPrices[priceId];
+        return price ? jsonRes(price) : jsonRes({ error: { message: "No such price" } }, 404);
+      }
       if (path === "/products") {
         return jsonRes({ id: `prod_${seq}` });
       }
@@ -188,6 +197,73 @@ test("v2: checkout session creation rejects an unknown or inactive price_ref", a
     const data = await res.json();
     assert.equal(data.error.code, "UNKNOWN_PRICE_REF");
     assert.equal(stripe.calls.length, 0, "must not call Stripe checkout creation for an unresolved price_ref");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("v2: registering a product with provider_price_id reuses the existing Stripe price instead of creating a new one", async () => {
+  const { env, products } = makeEnv();
+  const stripe = fakeStripeFetch();
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = stripe.fetchImpl;
+  try {
+    await worker.fetch(
+      req("/api/ventures/register", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "weylandai", webhook_url: "https://weylandai.com/hook", hmac_secret: "s3cret" },
+      }),
+      env
+    );
+    const prodRes = await worker.fetch(
+      req("/api/v2/products", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "weylandai", name: "SubX seat", provider_price_id: "price_existing_live" },
+      }),
+      env
+    );
+    assert.equal(prodRes.status, 201);
+    const prodData = await prodRes.json();
+    assert.equal(prodData.product.unit_amount_cents, 29900, "amount must come from the real Stripe price, not a guess");
+    assert.equal(prodData.product.currency, "usd");
+    assert.equal(prodData.product.recurring_interval, "month");
+    assert.equal(products[0].provider_price_id, "price_existing_live", "must reuse the existing price id, not mint a new one");
+    assert.ok(
+      !stripe.calls.some((c) => c.path === "/products" || c.path === "/prices"),
+      "must not create a new Stripe Product/Price when reusing an existing price"
+    );
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("v2: registering a product with an inactive provider_price_id is rejected", async () => {
+  const { env } = makeEnv();
+  const stripe = fakeStripeFetch();
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = stripe.fetchImpl;
+  try {
+    await worker.fetch(
+      req("/api/ventures/register", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "weylandai", webhook_url: "https://weylandai.com/hook", hmac_secret: "s3cret" },
+      }),
+      env
+    );
+    const res = await worker.fetch(
+      req("/api/v2/products", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "weylandai", name: "Dead seat", provider_price_id: "price_existing_inactive" },
+      }),
+      env
+    );
+    assert.equal(res.status, 400);
+    const data = await res.json();
+    assert.equal(data.error.code, "INACTIVE_PRICE");
   } finally {
     globalThis.fetch = origFetch;
   }

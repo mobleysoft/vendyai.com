@@ -352,9 +352,12 @@ export default {
       } catch {
         return errorResponse("INVALID_JSON", "invalid JSON body");
       }
-      const { venture_id, name, description, unit_amount_cents, currency, recurring_interval } = body || {};
-      if (!venture_id || !name || !Number.isInteger(unit_amount_cents) || unit_amount_cents <= 0) {
-        return errorResponse("VALIDATION_ERROR", "venture_id, name, and a positive integer unit_amount_cents are required");
+      const { venture_id, name, description, unit_amount_cents, currency, recurring_interval, provider_price_id } = body || {};
+      if (!venture_id || !name) {
+        return errorResponse("VALIDATION_ERROR", "venture_id and name are required");
+      }
+      if (!provider_price_id && (!Number.isInteger(unit_amount_cents) || unit_amount_cents <= 0)) {
+        return errorResponse("VALIDATION_ERROR", "a positive integer unit_amount_cents is required unless provider_price_id references an existing price");
       }
       const registration = await env.DB.prepare(
         "SELECT venture_id FROM venture_webhook_endpoints WHERE venture_id = ?"
@@ -362,21 +365,47 @@ export default {
       if (!registration) {
         return errorResponse("UNKNOWN_VENTURE", `venture_id "${venture_id}" is not registered - see POST /api/ventures/register`, 404);
       }
-      const cur = (currency || "usd").toLowerCase();
       try {
-        const product = await stripeRequest(env, "POST", "/products", { name, description: description || undefined });
-        const priceBody = {
-          product: product.id,
-          unit_amount: unit_amount_cents,
-          currency: cur,
-        };
-        if (recurring_interval) priceBody.recurring = { interval: recurring_interval };
-        const price = await stripeRequest(env, "POST", "/prices", priceBody);
+        let resolvedPriceId, resolvedAmount, resolvedCurrency, resolvedRecurring;
+        if (provider_price_id) {
+          // Migration path for a product that predates this catalog: reuse
+          // an already-live Stripe price instead of minting a duplicate
+          // Product+Price for something that already exists (found
+          // 2026-09-15 - the create-only path below made it impossible to
+          // bring any pre-existing live product into the v2 catalog without
+          // duplicating it in Stripe, which blocked the one real migration
+          // this catalog was built for - see VENDYAI_PROVIDER_ABSTRACTION.md
+          // step 2 / this venture's own recorded next_step). Fields are read
+          // back from Stripe's own price object, not trusted from the
+          // request body, so the catalog can't drift from the real price.
+          const price = await stripeRequest(env, "GET", `/prices/${provider_price_id}`);
+          if (!price.active) {
+            return errorResponse("INACTIVE_PRICE", `provider_price_id "${provider_price_id}" is not an active Stripe price`, 400);
+          }
+          resolvedPriceId = price.id;
+          resolvedAmount = price.unit_amount;
+          resolvedCurrency = price.currency;
+          resolvedRecurring = price.recurring?.interval || null;
+        } else {
+          const cur = (currency || "usd").toLowerCase();
+          const product = await stripeRequest(env, "POST", "/products", { name, description: description || undefined });
+          const priceBody = {
+            product: product.id,
+            unit_amount: unit_amount_cents,
+            currency: cur,
+          };
+          if (recurring_interval) priceBody.recurring = { interval: recurring_interval };
+          const price = await stripeRequest(env, "POST", "/prices", priceBody);
+          resolvedPriceId = price.id;
+          resolvedAmount = unit_amount_cents;
+          resolvedCurrency = cur;
+          resolvedRecurring = recurring_interval || null;
+        }
         const priceRef = `vpr_${crypto.randomUUID().replace(/-/g, "")}`;
         await env.DB.prepare(
           "INSERT INTO products (id, venture_id, name, description, unit_amount_cents, currency, recurring_interval, provider_price_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-        ).bind(priceRef, venture_id, name, description || null, unit_amount_cents, cur, recurring_interval || null, price.id).run();
-        return jsonResponse({ product: { price_ref: priceRef, venture_id, name, unit_amount_cents, currency: cur, recurring_interval: recurring_interval || null } }, 201);
+        ).bind(priceRef, venture_id, name, description || null, resolvedAmount, resolvedCurrency, resolvedRecurring, resolvedPriceId).run();
+        return jsonResponse({ product: { price_ref: priceRef, venture_id, name, unit_amount_cents: resolvedAmount, currency: resolvedCurrency, recurring_interval: resolvedRecurring } }, 201);
       } catch (err) {
         console.error("[vendyai] product registration failed:", err.message);
         return errorResponse("STRIPE_ERROR", err.message, 502);
