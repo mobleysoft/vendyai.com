@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { fakeD1 } from "./fake-d1.mjs";
 import worker from "../src/worker.js";
 
@@ -264,6 +265,138 @@ test("v2: registering a product with an inactive provider_price_id is rejected",
     assert.equal(res.status, 400);
     const data = await res.json();
     assert.equal(data.error.code, "INACTIVE_PRICE");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("webhook: a completed checkout posts a real settlement entry to mobcoin.cc's ledger", async () => {
+  const { env, sessions } = makeEnv();
+  env.STRIPE_WEBHOOK_SECRET = "whsec_test";
+  const mobcoinCalls = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const href = typeof url === "string" ? url : url.toString();
+    if (href.startsWith("https://mobcoin.cc/api/mobcoin/ledger")) {
+      mobcoinCalls.push({ url: href, body: JSON.parse(opts.body) });
+      return jsonRes({ ok: true, id: "entry_1" }, 201);
+    }
+    if (href.includes("/checkout/sessions/cs_test_settle")) {
+      return jsonRes({
+        payment_intent: {
+          latest_charge: {
+            balance_transaction: { fee: 42, net: 358 },
+          },
+        },
+      });
+    }
+    return jsonRes({ error: { message: `unhandled fetch ${href}` } }, 500);
+  };
+  try {
+    await worker.fetch(
+      req("/api/ventures/register", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "weylandai", webhook_url: "https://weylandai.com/hook", hmac_secret: "s3cret" },
+      }),
+      env
+    );
+    sessions.push({ id: "row1", venture_id: "weylandai", stripe_session_id: "cs_test_settle", status: "open" });
+
+    const payload = JSON.stringify({
+      type: "checkout.session.completed",
+      data: {
+        object: {
+          id: "cs_test_settle",
+          customer: "cus_123",
+          amount_total: 400,
+          currency: "usd",
+          metadata: { venture_id: "weylandai" },
+        },
+      },
+    });
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const signature = createHmac("sha256", env.STRIPE_WEBHOOK_SECRET).update(`${timestamp}.${payload}`).digest("hex");
+
+    const res = await worker.fetch(
+      new Request("https://vendyai.com/api/stripe/webhook", {
+        method: "POST",
+        headers: { "Stripe-Signature": `t=${timestamp},v1=${signature}` },
+        body: payload,
+      }),
+      env
+    );
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.mobcoin_ledger.posted, true);
+
+    assert.equal(mobcoinCalls.length, 1, "must post exactly one settlement entry to mobcoin.cc's ledger");
+    assert.equal(mobcoinCalls[0].body.from_venture, "vendyai.com");
+    assert.equal(mobcoinCalls[0].body.to_venture, "weylandai");
+    assert.equal(mobcoinCalls[0].body.units, 358, "must settle the real net-of-fee amount, not the gross amount");
+    assert.match(mobcoinCalls[0].body.memo, /cs_test_settle/);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("webhook: an out-of-range settlement amount is skipped, not posted, to mobcoin.cc's ledger", async () => {
+  const { env, sessions } = makeEnv();
+  env.STRIPE_WEBHOOK_SECRET = "whsec_test";
+  const mobcoinCalls = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const href = typeof url === "string" ? url : url.toString();
+    if (href.startsWith("https://mobcoin.cc/api/mobcoin/ledger")) {
+      mobcoinCalls.push({ url: href, body: JSON.parse(opts.body) });
+      return jsonRes({ ok: true }, 201);
+    }
+    if (href.includes("/checkout/sessions/cs_test_toobig")) {
+      // Fee capture fails/returns nothing usable - falls back to gross,
+      // which here deliberately exceeds the ledger's own validated bound.
+      return jsonRes({ payment_intent: {} });
+    }
+    return jsonRes({ error: { message: `unhandled fetch ${href}` } }, 500);
+  };
+  try {
+    await worker.fetch(
+      req("/api/ventures/register", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "weylandai", webhook_url: "https://weylandai.com/hook", hmac_secret: "s3cret" },
+      }),
+      env
+    );
+    sessions.push({ id: "row2", venture_id: "weylandai", stripe_session_id: "cs_test_toobig", status: "open" });
+
+    const payload = JSON.stringify({
+      type: "checkout.session.completed",
+      data: {
+        object: {
+          id: "cs_test_toobig",
+          customer: "cus_123",
+          amount_total: 5000000,
+          currency: "usd",
+          metadata: { venture_id: "weylandai" },
+        },
+      },
+    });
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const signature = createHmac("sha256", env.STRIPE_WEBHOOK_SECRET).update(`${timestamp}.${payload}`).digest("hex");
+
+    const res = await worker.fetch(
+      new Request("https://vendyai.com/api/stripe/webhook", {
+        method: "POST",
+        headers: { "Stripe-Signature": `t=${timestamp},v1=${signature}` },
+        body: payload,
+      }),
+      env
+    );
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.mobcoin_ledger.posted, false);
+    assert.equal(data.mobcoin_ledger.reason, "units_out_of_range");
+    assert.equal(mobcoinCalls.length, 0, "must not post an out-of-range amount to the ledger");
   } finally {
     globalThis.fetch = origFetch;
   }

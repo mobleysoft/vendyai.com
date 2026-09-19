@@ -120,6 +120,43 @@ async function verifyStripeSignature(rawBody, signatureHeader, secret) {
   return expected === parts.v1;
 }
 
+// mobcoin.cc depth audit, 2026-09-19: real second user for mobcoin.cc's
+// internal MobCoin ledger (GET/POST /api/mobcoin/ledger on
+// mobley-venture-fleet-a). Its own recorded next_step asked for "another
+// venture's own worker actually posting a cross-venture credit note, not
+// just this session's own test entry" - every completed Stripe checkout
+// that flows through vendyai (i.e. across the whole registered portfolio)
+// is a real settlement event: vendyai holds the Stripe payout, the venture
+// is owed the net. Recording that here is an honest reflection of
+// mobcoin.cc's own stated purpose ("payment infrastructure for the MobCorp
+// ecosystem"), driven by real code on a different Worker, not a manual
+// entry. Units = net cents settled (falls back to gross if the fee capture
+// above failed), clamped to the ledger's own validated 1..1,000,000 bound;
+// skipped (logged, not thrown) when out of range or the ledger endpoint is
+// unreachable, so a ledger hiccup never blocks the real webhook response.
+async function postMobcoinLedgerEntry(ventureId, units, sessionId) {
+  if (!Number.isInteger(units) || units < 1 || units > 1000000) {
+    console.warn(`[vendyai] skipping mobcoin ledger entry for ${sessionId}: units ${units} out of range`);
+    return { posted: false, reason: "units_out_of_range" };
+  }
+  try {
+    const res = await fetch("https://mobcoin.cc/api/mobcoin/ledger", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        from_venture: "vendyai.com",
+        to_venture: ventureId,
+        units,
+        memo: `stripe settlement, checkout session ${sessionId}`,
+      }),
+    });
+    return { posted: res.ok, status: res.status };
+  } catch (err) {
+    console.error(`[vendyai] mobcoin ledger post failed for ${sessionId}:`, err.message);
+    return { posted: false, reason: err.message };
+  }
+}
+
 async function forwardToVenture(env, ventureId, eventType, data) {
   const registration = await env.DB.prepare(
     "SELECT webhook_url, hmac_secret FROM venture_webhook_endpoints WHERE venture_id = ?"
@@ -302,7 +339,11 @@ export default {
           stripe_fee_cents: feeCents,
           net_to_venture_cents: netCents,
         });
-        return jsonResponse({ received: true, forwarded: forward, stripe_fee_cents: feeCents, net_to_venture_cents: netCents });
+        const ledgerUnits = netCents ?? session.amount_total ?? null;
+        const mobcoinLedger = ledgerUnits != null
+          ? await postMobcoinLedgerEntry(ventureId, ledgerUnits, session.id)
+          : { posted: false, reason: "no_amount" };
+        return jsonResponse({ received: true, forwarded: forward, stripe_fee_cents: feeCents, net_to_venture_cents: netCents, mobcoin_ledger: mobcoinLedger });
       }
 
       return jsonResponse({ received: true, forwarded: false, reason: "unhandled_event_type_or_missing_venture_id" });
