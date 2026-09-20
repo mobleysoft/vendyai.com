@@ -282,11 +282,18 @@ export default {
     if (url.pathname.startsWith("/api/checkout/sessions/") && request.method === "GET") {
       const sessionId = url.pathname.slice("/api/checkout/sessions/".length);
       if (!sessionId) return errorResponse("VALIDATION_ERROR", "session id required", 400);
+      // 2026-09-20 depth audit (bloomagi.cc): added created_at to this
+      // response. Consumers gating a time-limited pass (e.g. bloomagi.cc's
+      // "$4, 30-day Pro pass") had no way to check purchase age server-side -
+      // a completed session's `status` never changes, so a single payment
+      // granted permanent access forever, contradicting the pass's own
+      // description. Purely additive field; existing consumers that only
+      // read venture_id/status/amount_total/currency are unaffected.
       const row = await env.DB.prepare(
-        "SELECT venture_id, status, amount_total, currency FROM checkout_sessions WHERE stripe_session_id = ?"
+        "SELECT venture_id, status, amount_total, currency, created_at FROM checkout_sessions WHERE stripe_session_id = ?"
       ).bind(sessionId).first();
       if (!row) return errorResponse("NOT_FOUND", "no such checkout session", 404);
-      return jsonResponse({ venture_id: row.venture_id, status: row.status, amount_total: row.amount_total, currency: row.currency });
+      return jsonResponse({ venture_id: row.venture_id, status: row.status, amount_total: row.amount_total, currency: row.currency, created_at: row.created_at });
     }
 
     if (url.pathname === "/api/portal/sessions" && request.method === "POST") {
