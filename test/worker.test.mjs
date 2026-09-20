@@ -435,3 +435,29 @@ test("v1: existing /api/checkout/sessions contract is completely unaffected by t
     globalThis.fetch = origFetch;
   }
 });
+
+test("admin prune: deletes only 'open' sessions older than the cutoff, leaves recent and completed rows alone", async () => {
+  const { env, sessions } = makeEnv();
+  sessions.push(
+    { id: "a", venture_id: "x", stripe_session_id: "cs_old_open", status: "open", created_at: "2026-09-01 00:00:00" },
+    { id: "b", venture_id: "x", stripe_session_id: "cs_old_completed", status: "completed", created_at: "2026-09-01 00:00:00" },
+    { id: "c", venture_id: "x", stripe_session_id: "cs_recent_open", status: "open", created_at: "2026-09-19 23:00:00" }
+  );
+  const res = await worker.fetch(
+    req("/api/admin/prune-stale-sessions", { method: "POST", headers: { "X-Admin-Secret": ADMIN_SECRET } }),
+    env
+  );
+  assert.equal(res.status, 200);
+  const data = await res.json();
+  assert.equal(data.deleted, 1);
+  assert.equal(sessions.length, 2);
+  assert.ok(sessions.some((s) => s.stripe_session_id === "cs_old_completed"), "completed rows must never be pruned");
+  assert.ok(sessions.some((s) => s.stripe_session_id === "cs_recent_open"), "recent open rows must survive");
+  assert.ok(!sessions.some((s) => s.stripe_session_id === "cs_old_open"), "stale open row must be deleted");
+});
+
+test("admin prune: rejected without the admin secret", async () => {
+  const { env } = makeEnv();
+  const res = await worker.fetch(req("/api/admin/prune-stale-sessions", { method: "POST" }), env);
+  assert.equal(res.status, 401);
+});

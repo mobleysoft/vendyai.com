@@ -36,8 +36,15 @@ export function fakeD1() {
               } else if (sql.startsWith("INSERT INTO products")) {
                 const [id, venture_id, name, description, unit_amount_cents, currency, recurring_interval, provider_price_id] = args;
                 products.push({ id, venture_id, name, description, unit_amount_cents, currency, recurring_interval, provider_price_id, active: 1 });
+              } else if (sql.startsWith("DELETE FROM checkout_sessions WHERE status = 'open'")) {
+                const [cutoff] = args;
+                const before = sessions.length;
+                for (let i = sessions.length - 1; i >= 0; i--) {
+                  if (sessions[i].status === "open" && (sessions[i].created_at || "") < cutoff) sessions.splice(i, 1);
+                }
+                return { success: true, meta: { changes: before - sessions.length } };
               }
-              return { success: true };
+              return { success: true, meta: { changes: 0 } };
             },
             async first() {
               if (sql.startsWith("SELECT venture_id FROM venture_webhook_endpoints")) {

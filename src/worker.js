@@ -157,6 +157,27 @@ async function postMobcoinLedgerEntry(ventureId, units, sessionId) {
   }
 }
 
+// 2026-09-20 depth audit: checkout_sessions has grown to 375 rows across 73
+// registered ventures since 2026-09-03, every single one still "open" -
+// verified this is expected, not a bug (every row traces to a depth-audit
+// session's own live-verification checkout create, never a real completed
+// payment; agents correctly never complete a real Stripe charge on their
+// own) - but nothing ever pruned them, and Stripe Checkout Sessions
+// themselves expire after 24h by default, so any row still "open" past 2
+// days is provably dead: Stripe will never send a completed/expired event
+// for it. Unbounded growth with no cleanup is a real, if minor, gap - this
+// closes it without touching any row that could still transition state.
+async function pruneStaleCheckoutSessions(env, olderThanDays = 2) {
+  const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .replace("T", " ")
+    .slice(0, 19);
+  const result = await env.DB.prepare(
+    "DELETE FROM checkout_sessions WHERE status = 'open' AND created_at < ?"
+  ).bind(cutoff).run();
+  return { deleted: result.meta?.changes ?? 0, cutoff };
+}
+
 async function forwardToVenture(env, ventureId, eventType, data) {
   const registration = await env.DB.prepare(
     "SELECT webhook_url, hmac_secret FROM venture_webhook_endpoints WHERE venture_id = ?"
@@ -187,8 +208,27 @@ async function forwardToVenture(env, ventureId, eventType, data) {
 }
 
 export default {
+  // Daily Cloudflare Cron Trigger (see wrangler.toml [triggers]) - real
+  // scheduled cleanup, not just a callable-on-demand function nobody calls.
+  async scheduled(event, env, ctx) {
+    const result = await pruneStaleCheckoutSessions(env);
+    console.log(`[vendyai] scheduled prune: deleted ${result.deleted} stale open sessions older than ${result.cutoff}`);
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    // Admin-triggered on-demand prune, additive to the scheduled cron above -
+    // exists so this pass's fix could be live-verified immediately via a real
+    // HTTP call instead of waiting up to 24h for the cron to fire.
+    if (url.pathname === "/api/admin/prune-stale-sessions" && request.method === "POST") {
+      const adminSecret = request.headers.get("X-Admin-Secret");
+      if (!env.ADMIN_SECRET || adminSecret !== env.ADMIN_SECRET) {
+        return errorResponse("UNAUTHORIZED", "invalid admin secret", 401);
+      }
+      const result = await pruneStaleCheckoutSessions(env);
+      return jsonResponse({ ok: true, ...result });
+    }
 
     if (url.pathname === "/health" && request.method === "GET") {
       return jsonResponse({ status: "ok", service: "vendyai-com-worker" });

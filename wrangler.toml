@@ -16,3 +16,7 @@ zone_name = "vendyai.com"
 [[routes]]
 pattern = "www.vendyai.com/*"
 zone_name = "vendyai.com"
+
+# Daily stale-checkout-session prune (2026-09-20 depth audit) - 06:00 UTC.
+[triggers]
+crons = ["0 6 * * *"]
