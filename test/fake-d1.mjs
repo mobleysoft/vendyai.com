@@ -59,6 +59,13 @@ export function fakeD1() {
                 const s = sessions.find((s) => s.stripe_session_id === args[0]);
                 return s ? { venture_id: s.venture_id, status: s.status, amount_total: s.amount_total, currency: s.currency } : null;
               }
+              if (sql.startsWith("UPDATE checkout_sessions SET status = 'completed'")) {
+                const [stripe_customer_id, stripe_session_id] = args;
+                const row = sessions.find((s) => s.stripe_session_id === stripe_session_id);
+                if (!row) return null;
+                Object.assign(row, { status: "completed", stripe_customer_id });
+                return { api_version: row.api_version || "v1" };
+              }
               if (sql.startsWith("SELECT provider_price_id FROM products")) {
                 const [priceRef, ventureId] = args;
                 const p = products.find((p) => p.id === priceRef && p.venture_id === ventureId && p.active === 1);

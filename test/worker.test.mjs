@@ -436,6 +436,149 @@ test("v1: existing /api/checkout/sessions contract is completely unaffected by t
   }
 });
 
+test("webhook: v1 session forwards the legacy Stripe-shaped payload, byte-for-byte unchanged", async () => {
+  const { env, sessions } = makeEnv();
+  env.STRIPE_WEBHOOK_SECRET = "whsec_test";
+  const forwardCalls = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const href = typeof url === "string" ? url : url.toString();
+    if (href === "https://weylandai.com/hook") {
+      forwardCalls.push(JSON.parse(opts.body));
+      return jsonRes({ ok: true });
+    }
+    if (href.startsWith("https://mobcoin.cc/api/mobcoin/ledger")) {
+      return jsonRes({ ok: true, id: "entry_1" }, 201);
+    }
+    if (href.includes("/checkout/sessions/cs_test_v1fwd")) {
+      return jsonRes({ payment_intent: { latest_charge: { balance_transaction: { fee: 10, net: 90 } } } });
+    }
+    return jsonRes({ error: { message: `unhandled fetch ${href}` } }, 500);
+  };
+  try {
+    await worker.fetch(
+      req("/api/ventures/register", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "weylandai", webhook_url: "https://weylandai.com/hook", hmac_secret: "s3cret" },
+      }),
+      env
+    );
+    sessions.push({ id: "row3", venture_id: "weylandai", stripe_session_id: "cs_test_v1fwd", status: "open", api_version: "v1" });
+
+    const payload = JSON.stringify({
+      type: "checkout.session.completed",
+      data: {
+        object: {
+          id: "cs_test_v1fwd",
+          customer: "cus_v1",
+          mode: "payment",
+          amount_total: 100,
+          currency: "usd",
+          customer_details: { email: "a@b.com", name: "A B" },
+          metadata: { venture_id: "weylandai" },
+        },
+      },
+    });
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const signature = createHmac("sha256", env.STRIPE_WEBHOOK_SECRET).update(`${timestamp}.${payload}`).digest("hex");
+
+    const res = await worker.fetch(
+      new Request("https://vendyai.com/api/stripe/webhook", {
+        method: "POST",
+        headers: { "Stripe-Signature": `t=${timestamp},v1=${signature}` },
+        body: payload,
+      }),
+      env
+    );
+    assert.equal(res.status, 200);
+    assert.equal(forwardCalls.length, 1);
+    assert.equal(forwardCalls[0].type, "checkout.session.completed", "v1 sessions must keep the legacy {type, data} shape");
+    assert.equal(forwardCalls[0].data.id, "cs_test_v1fwd");
+    assert.equal(forwardCalls[0].data.customer, "cus_v1");
+    assert.equal(forwardCalls[0].data.stripe_fee_cents, 10);
+    assert.equal(forwardCalls[0].data.net_to_venture_cents, 90);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("webhook: v2 session forwards the provider-neutral payment.completed shape, not Stripe's own", async () => {
+  const { env, sessions } = makeEnv();
+  env.STRIPE_WEBHOOK_SECRET = "whsec_test";
+  const forwardCalls = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const href = typeof url === "string" ? url : url.toString();
+    if (href === "https://weylandai.com/hook") {
+      forwardCalls.push(JSON.parse(opts.body));
+      return jsonRes({ ok: true });
+    }
+    if (href.startsWith("https://mobcoin.cc/api/mobcoin/ledger")) {
+      return jsonRes({ ok: true, id: "entry_1" }, 201);
+    }
+    if (href.includes("/checkout/sessions/cs_test_v2fwd")) {
+      return jsonRes({ payment_intent: { latest_charge: { balance_transaction: { fee: 12, net: 388 } } } });
+    }
+    return jsonRes({ error: { message: `unhandled fetch ${href}` } }, 500);
+  };
+  try {
+    await worker.fetch(
+      req("/api/ventures/register", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "weylandai", webhook_url: "https://weylandai.com/hook", hmac_secret: "s3cret" },
+      }),
+      env
+    );
+    sessions.push({ id: "row4", venture_id: "weylandai", stripe_session_id: "cs_test_v2fwd", status: "open", api_version: "v2" });
+
+    const payload = JSON.stringify({
+      type: "checkout.session.completed",
+      data: {
+        object: {
+          id: "cs_test_v2fwd",
+          customer: "cus_v2",
+          amount_total: 400,
+          currency: "usd",
+          customer_details: { email: "c@d.com", name: "C D" },
+          metadata: { venture_id: "weylandai", product_id: "widget" },
+        },
+      },
+    });
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const signature = createHmac("sha256", env.STRIPE_WEBHOOK_SECRET).update(`${timestamp}.${payload}`).digest("hex");
+
+    const res = await worker.fetch(
+      new Request("https://vendyai.com/api/stripe/webhook", {
+        method: "POST",
+        headers: { "Stripe-Signature": `t=${timestamp},v1=${signature}` },
+        body: payload,
+      }),
+      env
+    );
+    assert.equal(res.status, 200);
+    assert.equal(forwardCalls.length, 1);
+    const fwd = forwardCalls[0];
+    assert.equal(fwd.event, "payment.completed");
+    assert.equal(fwd.venture_id, "weylandai");
+    assert.equal(fwd.external_reference, "cs_test_v2fwd");
+    assert.equal(fwd.customer.ref, "cus_v2");
+    assert.equal(fwd.customer.email, "c@d.com");
+    assert.equal(fwd.customer.name, "C D");
+    assert.equal(fwd.amount_total_cents, 400);
+    assert.equal(fwd.currency, "usd");
+    assert.equal(fwd.provider_fee_cents, 12);
+    assert.equal(fwd.net_cents, 388);
+    assert.deepEqual(fwd.metadata, { venture_id: "weylandai", product_id: "widget" });
+    assert.ok(fwd.occurred_at, "must include a real timestamp");
+    assert.equal(fwd.type, undefined, "v2 shape must not carry the old Stripe-mirrored field names");
+    assert.equal(fwd.data, undefined);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
 test("admin prune: deletes only 'open' sessions older than the cutoff, leaves recent and completed rows alone", async () => {
   const { env, sessions } = makeEnv();
   sessions.push(

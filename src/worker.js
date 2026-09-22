@@ -178,7 +178,12 @@ async function pruneStaleCheckoutSessions(env, olderThanDays = 2) {
   return { deleted: result.meta?.changes ?? 0, cutoff };
 }
 
-async function forwardToVenture(env, ventureId, eventType, data) {
+// 2026-09-22 depth audit: takes a fully-shaped payload rather than
+// building {type, data} itself, so callers can send either the legacy
+// v1 (Stripe-shaped) or the v2 (provider-neutral, VENDYAI_PROVIDER_
+// ABSTRACTION.md section 3) wire format - the signing/delivery mechanics
+// are identical either way, only the JSON shape differs.
+async function forwardToVenture(env, ventureId, payload) {
   const registration = await env.DB.prepare(
     "SELECT webhook_url, hmac_secret FROM venture_webhook_endpoints WHERE venture_id = ?"
   ).bind(ventureId).first();
@@ -187,7 +192,7 @@ async function forwardToVenture(env, ventureId, eventType, data) {
     return { forwarded: false, reason: "unregistered_venture" };
   }
   const timestamp = Math.floor(Date.now() / 1000).toString();
-  const body = JSON.stringify({ type: eventType, data });
+  const body = JSON.stringify(payload);
   const signedPayload = `${timestamp}.${body}`;
   const signature = await hmacSha256Base64Url(signedPayload, registration.hmac_secret);
   try {
@@ -335,9 +340,10 @@ export default {
       const ventureId = session.metadata?.venture_id;
 
       if (event.type === "checkout.session.completed" && ventureId) {
-        await env.DB.prepare(
-          "UPDATE checkout_sessions SET status = 'completed', stripe_customer_id = ? WHERE stripe_session_id = ?"
-        ).bind(session.customer || null, session.id).run();
+        const sessionRow = await env.DB.prepare(
+          "UPDATE checkout_sessions SET status = 'completed', stripe_customer_id = ? WHERE stripe_session_id = ? RETURNING api_version"
+        ).bind(session.customer || null, session.id).first();
+        const apiVersion = sessionRow?.api_version || "v1";
 
         // Real fee pass-through: pull Stripe's own balance_transaction for
         // this charge rather than assuming a flat rate. That's the actual
@@ -363,29 +369,54 @@ export default {
           console.error("[vendyai] fee capture failed for", session.id, ":", err.message);
         }
 
-        // Field names deliberately mirror Stripe's own checkout.session
-        // object for now (id, customer, mode, customer_details) so existing
-        // consumers (weylandai's webhook handler) need minimal changes to
-        // read this. This is a real, acknowledged debt: a provider-neutral
-        // wire format for this forward is the actual target (see
-        // VENDYAI_PROVIDER_ABSTRACTION.md) - deferred, not solved here,
-        // since redesigning the contract for all registered ventures is a
-        // bigger, separate change from making the flow work correctly.
-        const forward = await forwardToVenture(env, ventureId, "checkout.session.completed", {
-          id: session.id,
-          mode: session.mode,
-          metadata: session.metadata,
-          customer: session.customer,
-          // Stripe includes customer_details (email/name/address) directly
-          // on checkout.session.completed by default, no expansion needed -
-          // forwarded here so every consuming venture doesn't have to make
-          // its own extra Stripe API call just to learn who paid.
-          customer_details: session.customer_details || null,
-          amount_total: session.amount_total,
-          currency: session.currency,
-          stripe_fee_cents: feeCents,
-          net_to_venture_cents: netCents,
-        });
+        // 2026-09-22 depth audit: closes VENDYAI_PROVIDER_ABSTRACTION.md
+        // section 3, the one piece of the provider-abstraction design left
+        // unbuilt after 2026-09-18's catalog/v2-checkout work. Gated on the
+        // session's own api_version (set at creation time by which checkout
+        // endpoint made it - v1 /api/checkout/sessions vs v2 /api/v2/
+        // checkout/sessions), so weylandai - the only real consumer today,
+        // still exclusively on v1 - gets byte-for-byte the same Stripe-
+        // shaped forward it always has. A venture created via v2 gets the
+        // provider-neutral shape from the design doc instead; no consumer
+        // has to opt in or change code for this to be correct, since which
+        // shape they get is fully determined by which checkout API they
+        // already called.
+        const forwardPayload = apiVersion === "v2"
+          ? {
+              event: "payment.completed",
+              venture_id: ventureId,
+              external_reference: session.id,
+              customer: {
+                ref: session.customer || null,
+                email: session.customer_details?.email || null,
+                name: session.customer_details?.name || null,
+              },
+              amount_total_cents: session.amount_total,
+              currency: session.currency,
+              provider_fee_cents: feeCents,
+              net_cents: netCents,
+              metadata: session.metadata || {},
+              occurred_at: new Date().toISOString(),
+            }
+          : {
+              // Legacy v1 shape - field names deliberately mirror Stripe's
+              // own checkout.session object (id, customer, mode,
+              // customer_details) so weylandai's existing webhook handler
+              // needs zero changes. Unchanged from before this pass.
+              type: "checkout.session.completed",
+              data: {
+                id: session.id,
+                mode: session.mode,
+                metadata: session.metadata,
+                customer: session.customer,
+                customer_details: session.customer_details || null,
+                amount_total: session.amount_total,
+                currency: session.currency,
+                stripe_fee_cents: feeCents,
+                net_to_venture_cents: netCents,
+              },
+            };
+        const forward = await forwardToVenture(env, ventureId, forwardPayload);
         const ledgerUnits = netCents ?? session.amount_total ?? null;
         const mobcoinLedger = ledgerUnits != null
           ? await postMobcoinLedgerEntry(ventureId, ledgerUnits, session.id)
