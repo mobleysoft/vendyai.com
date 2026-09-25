@@ -594,11 +594,20 @@ test("webhook: v2 session forwards the provider-neutral payment.completed shape,
 });
 
 test("admin prune: deletes only 'open' sessions older than the cutoff, leaves recent and completed rows alone", async () => {
+  // Timestamps computed relative to the real clock at test-run time, not
+  // hardcoded absolute dates - a hardcoded "recent" date silently becomes
+  // "stale" once enough real time passes, making this test fail on an
+  // unrelated later date with no code change (found 2026-09-25: the old
+  // "2026-09-19 23:00:00" "recent" row had drifted past the 2-day cutoff
+  // by the time this ran, deleting 2 rows instead of the expected 1).
+  const toSqlTimestamp = (d) => d.toISOString().replace("T", " ").slice(0, 19);
+  const fiveDaysAgo = toSqlTimestamp(new Date(Date.now() - 5 * 24 * 60 * 60 * 1000));
+  const oneHourAgo = toSqlTimestamp(new Date(Date.now() - 60 * 60 * 1000));
   const { env, sessions } = makeEnv();
   sessions.push(
-    { id: "a", venture_id: "x", stripe_session_id: "cs_old_open", status: "open", created_at: "2026-09-01 00:00:00" },
-    { id: "b", venture_id: "x", stripe_session_id: "cs_old_completed", status: "completed", created_at: "2026-09-01 00:00:00" },
-    { id: "c", venture_id: "x", stripe_session_id: "cs_recent_open", status: "open", created_at: "2026-09-19 23:00:00" }
+    { id: "a", venture_id: "x", stripe_session_id: "cs_old_open", status: "open", created_at: fiveDaysAgo },
+    { id: "b", venture_id: "x", stripe_session_id: "cs_old_completed", status: "completed", created_at: fiveDaysAgo },
+    { id: "c", venture_id: "x", stripe_session_id: "cs_recent_open", status: "open", created_at: oneHourAgo }
   );
   const res = await worker.fetch(
     req("/api/admin/prune-stale-sessions", { method: "POST", headers: { "X-Admin-Secret": ADMIN_SECRET } }),
