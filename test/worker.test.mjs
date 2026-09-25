@@ -278,7 +278,7 @@ test("webhook: a completed checkout posts a real settlement entry to mobcoin.cc'
   globalThis.fetch = async (url, opts) => {
     const href = typeof url === "string" ? url : url.toString();
     if (href.startsWith("https://mobcoin.cc/api/mobcoin/ledger")) {
-      mobcoinCalls.push({ url: href, body: JSON.parse(opts.body) });
+      mobcoinCalls.push({ url: href, headers: opts.headers, body: JSON.parse(opts.body) });
       return jsonRes({ ok: true, id: "entry_1" }, 201);
     }
     if (href.includes("/checkout/sessions/cs_test_settle")) {
@@ -298,6 +298,18 @@ test("webhook: a completed checkout posts a real settlement entry to mobcoin.cc'
         method: "POST",
         headers: { "X-Admin-Secret": ADMIN_SECRET },
         body: { venture_id: "weylandai", webhook_url: "https://weylandai.com/hook", hmac_secret: "s3cret" },
+      }),
+      env
+    );
+    // mobcoin.cc's own hmac registration (real production row, provisioned
+    // for its /api/vendyai-webhook signature verification) - postMobcoinLedgerEntry
+    // (2026-09-24 depth audit) now signs its outbound ledger POST with this
+    // same secret rather than posting unsigned.
+    await worker.fetch(
+      req("/api/ventures/register", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "mobcoin.cc", webhook_url: "https://mobcoin.cc/api/vendyai-webhook", hmac_secret: "mobcoin-s3cret" },
       }),
       env
     );
@@ -335,6 +347,8 @@ test("webhook: a completed checkout posts a real settlement entry to mobcoin.cc'
     assert.equal(mobcoinCalls[0].body.to_venture, "weylandai");
     assert.equal(mobcoinCalls[0].body.units, 358, "must settle the real net-of-fee amount, not the gross amount");
     assert.match(mobcoinCalls[0].body.memo, /cs_test_settle/);
+    assert.ok(mobcoinCalls[0].headers["X-Webhook-Signature"], "ledger POST must be HMAC-signed, not sent unsigned");
+    assert.ok(mobcoinCalls[0].headers["X-Webhook-Timestamp"]);
   } finally {
     globalThis.fetch = origFetch;
   }

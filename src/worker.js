@@ -134,21 +134,43 @@ async function verifyStripeSignature(rawBody, signatureHeader, secret) {
 // above failed), clamped to the ledger's own validated 1..1,000,000 bound;
 // skipped (logged, not thrown) when out of range or the ledger endpoint is
 // unreachable, so a ledger hiccup never blocks the real webhook response.
-async function postMobcoinLedgerEntry(ventureId, units, sessionId) {
+// mobcoin.cc depth audit, 2026-09-24: this POST used to go out completely
+// unsigned - mobcoin.cc's ledger endpoint accepted it (and any other
+// anonymous request) with no authentication at all, undermining its own
+// "internal accounting ledger" claim. Now signs with the same
+// venture_webhook_endpoints.hmac_secret already provisioned for mobcoin.cc's
+// vendyai-webhook registration (see forwardToVenture above) and the same
+// X-Webhook-Signature/X-Webhook-Timestamp scheme, rather than provisioning a
+// second secret for what's really the same trust relationship.
+async function postMobcoinLedgerEntry(env, ventureId, units, sessionId) {
   if (!Number.isInteger(units) || units < 1 || units > 1000000) {
     console.warn(`[vendyai] skipping mobcoin ledger entry for ${sessionId}: units ${units} out of range`);
     return { posted: false, reason: "units_out_of_range" };
   }
+  const registration = await env.DB.prepare(
+    "SELECT webhook_url, hmac_secret FROM venture_webhook_endpoints WHERE venture_id = ?"
+  ).bind("mobcoin.cc").first();
+  if (!registration) {
+    console.warn(`[vendyai] no mobcoin.cc hmac registration, skipping ledger entry for ${sessionId}`);
+    return { posted: false, reason: "unregistered_mobcoin_secret" };
+  }
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const body = JSON.stringify({
+    from_venture: "vendyai.com",
+    to_venture: ventureId,
+    units,
+    memo: `stripe settlement, checkout session ${sessionId}`,
+  });
+  const signature = await hmacSha256Base64Url(`${timestamp}.${body}`, registration.hmac_secret);
   try {
     const res = await fetch("https://mobcoin.cc/api/mobcoin/ledger", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        from_venture: "vendyai.com",
-        to_venture: ventureId,
-        units,
-        memo: `stripe settlement, checkout session ${sessionId}`,
-      }),
+      headers: {
+        "Content-Type": "application/json",
+        "X-Webhook-Signature": signature,
+        "X-Webhook-Timestamp": timestamp,
+      },
+      body,
     });
     return { posted: res.ok, status: res.status };
   } catch (err) {
@@ -419,7 +441,7 @@ export default {
         const forward = await forwardToVenture(env, ventureId, forwardPayload);
         const ledgerUnits = netCents ?? session.amount_total ?? null;
         const mobcoinLedger = ledgerUnits != null
-          ? await postMobcoinLedgerEntry(ventureId, ledgerUnits, session.id)
+          ? await postMobcoinLedgerEntry(env, ventureId, ledgerUnits, session.id)
           : { posted: false, reason: "no_amount" };
         return jsonResponse({ received: true, forwarded: forward, stripe_fee_cents: feeCents, net_to_venture_cents: netCents, mobcoin_ledger: mobcoinLedger });
       }
