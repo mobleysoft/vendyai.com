@@ -71,6 +71,19 @@ export function fakeD1() {
                 const p = products.find((p) => p.id === priceRef && p.venture_id === ventureId && p.active === 1);
                 return p ? { provider_price_id: p.provider_price_id } : null;
               }
+              if (sql.startsWith("SELECT id AS price_ref, name, unit_amount_cents, currency, recurring_interval FROM products")) {
+                const [ventureId, name] = args;
+                const p = products.find((p) => p.venture_id === ventureId && p.name === name && p.active === 1);
+                return p
+                  ? {
+                      price_ref: p.id,
+                      name: p.name,
+                      unit_amount_cents: p.unit_amount_cents,
+                      currency: p.currency,
+                      recurring_interval: p.recurring_interval,
+                    }
+                  : null;
+              }
               if (sql.startsWith("SELECT COUNT(*) AS n FROM venture_webhook_endpoints")) {
                 return { n: ventures.length };
               }

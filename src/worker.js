@@ -506,6 +506,20 @@ export default {
       if (!registration) {
         return errorResponse("UNKNOWN_VENTURE", `venture_id "${venture_id}" is not registered - see POST /api/ventures/register`, 404);
       }
+      // Idempotency check, added after finding a real duplicate in
+      // production 2026-09-26: bookclubs had two identical active $29/mo
+      // "bookclubs.cc Store Plan" products, each with its own real minted
+      // Stripe Product+Price, registered 3 minutes apart - a retried
+      // registration call had no way to know a matching product already
+      // existed and silently doubled the venture's live catalog. A venture
+      // registering the same named product again gets back the existing
+      // price_ref instead of a second Stripe object.
+      const existingProduct = await env.DB.prepare(
+        "SELECT id AS price_ref, name, unit_amount_cents, currency, recurring_interval FROM products WHERE venture_id = ? AND name = ? AND active = 1"
+      ).bind(venture_id, name).first();
+      if (existingProduct) {
+        return jsonResponse({ product: { ...existingProduct, venture_id }, reused: true }, 200);
+      }
       try {
         let resolvedPriceId, resolvedAmount, resolvedCurrency, resolvedRecurring;
         if (provider_price_id) {

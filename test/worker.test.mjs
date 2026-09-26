@@ -240,6 +240,55 @@ test("v2: registering a product with provider_price_id reuses the existing Strip
   }
 });
 
+test("v2: registering a product with the same venture_id and name twice reuses the existing product instead of minting a duplicate Stripe Product+Price", async () => {
+  const { env, products } = makeEnv();
+  const stripe = fakeStripeFetch();
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = stripe.fetchImpl;
+  try {
+    await worker.fetch(
+      req("/api/ventures/register", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "bookclubs", webhook_url: "https://bookclubs.cc/hook", hmac_secret: "s3cret" },
+      }),
+      env
+    );
+    const first = await worker.fetch(
+      req("/api/v2/products", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "bookclubs", name: "bookclubs.cc Store Plan", unit_amount_cents: 2900, recurring_interval: "month" },
+      }),
+      env
+    );
+    assert.equal(first.status, 201);
+    const firstData = await first.json();
+    assert.equal(products.length, 1, "sanity: exactly one product exists after the first registration");
+
+    const second = await worker.fetch(
+      req("/api/v2/products", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "bookclubs", name: "bookclubs.cc Store Plan", unit_amount_cents: 2900, recurring_interval: "month" },
+      }),
+      env
+    );
+    assert.equal(second.status, 200, "a repeat registration is a reuse, not a new creation (201)");
+    const secondData = await second.json();
+    assert.equal(secondData.product.price_ref, firstData.product.price_ref, "must return the SAME price_ref, not mint a second one");
+    assert.equal(secondData.reused, true);
+    assert.equal(products.length, 1, "no second product row was inserted");
+    assert.equal(
+      stripe.calls.filter((c) => c.path === "/products" || c.path === "/prices").length,
+      2,
+      "the first call mints exactly one real Stripe Product + one Price (2 calls); the second call must mint none"
+    );
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
 test("v2: registering a product with an inactive provider_price_id is rejected", async () => {
   const { env } = makeEnv();
   const stripe = fakeStripeFetch();
