@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VENDYAI // Sovereign Payment Abstraction & Universal Checkout Gateway</title>
+  <style>
+    :root {
+      --bg: #060911;
+      --panel: #0d1322;
+      --panel-border: #18233c;
+      --mint: #10b981;
+      --mint-dim: rgba(16, 185, 129, 0.12);
+      --mint-glow: rgba(16, 185, 129, 0.35);
+      --sky: #38bdf8;
+      --text: #f8fafc;
+      --text-muted: #8b9bb4;
+      --font-mono: "JetBrains Mono", Menlo, Consolas, monospace;
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: var(--font-sans);
+      line-height: 1.5;
+      padding: 24px;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+      padding-bottom: 20px;
+      border-bottom: 2px solid var(--panel-border);
+      margin-bottom: 24px;
+    }
+    .brand-title h1 {
+      font-size: 1.7rem;
+      font-weight: 900;
+      letter-spacing: -0.02em;
+      color: #fff;
+    }
+    .brand-title p {
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      color: var(--mint);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .badges-group {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .badge {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-weight: bold;
+    }
+    .badge-mint { background: var(--mint-dim); border: 1px solid var(--mint); color: var(--mint); }
+    .badge-sky { background: rgba(56, 189, 248, 0.12); border: 1px solid var(--sky); color: var(--sky); }
+
+    /* Telemetry KPI Cards */
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+      margin-bottom: 28px;
+    }
+    @media (max-width: 850px) { .kpi-row { grid-template-columns: 1fr 1fr; } }
+    .kpi-card {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-left: 4px solid var(--mint);
+      padding: 16px 20px;
+      border-radius: 8px;
+    }
+    .kpi-val { font-size: 1.8rem; font-weight: 800; font-family: var(--font-mono); color: #fff; }
+    .kpi-lbl { font-size: 0.72rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.05em; }
+
+    /* Main Grid */
+    .main-grid {
+      display: grid;
+      grid-template-columns: 460px 1fr;
+      gap: 24px;
+      margin-bottom: 32px;
+    }
+    @media (max-width: 1050px) { .main-grid { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 12px;
+      padding: 24px;
+    }
+    .panel-head {
+      border-bottom: 1px solid var(--panel-border);
+      padding-bottom: 12px;
+      margin-bottom: 18px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .panel-head h2 { font-size: 1.15rem; font-weight: 800; color: #fff; }
+    .panel-head span { font-family: var(--font-mono); font-size: 0.75rem; color: var(--mint); }
+
+    .form-group { margin-bottom: 16px; }
+    .form-group label {
+      display: block;
+      font-size: 0.75rem;
+      font-family: var(--font-mono);
+      text-transform: uppercase;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+    .form-input, .form-select {
+      width: 100%;
+      padding: 10px 12px;
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px solid var(--panel-border);
+      border-radius: 6px;
+      color: #fff;
+      font-family: var(--font-mono);
+      font-size: 0.9rem;
+      outline: none;
+    }
+    .form-input:focus, .form-select:focus { border-color: var(--mint); }
+
+    .btn {
+      width: 100%;
+      padding: 12px;
+      background: var(--mint);
+      color: #000;
+      border: 1px solid var(--mint);
+      border-radius: 6px;
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      font-weight: bold;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn:hover {
+      box-shadow: 0 0 20px var(--mint-glow);
+      transform: translateY(-1px);
+    }
+
+    /* Checkout & Webhook Simulator Box */
+    .webhook-box {
+      background: #04060d;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      padding: 16px;
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      color: #94a3b8;
+      overflow-x: auto;
+      max-height: 480px;
+      line-height: 1.6;
+    }
+    .webhook-box pre { margin: 0; }
+
+    footer {
+      border-top: 1px solid var(--panel-border);
+      padding-top: 20px;
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      color: var(--text-muted);
+      font-size: 0.82rem;
+    }
+    footer a { color: var(--mint); text-decoration: none; margin-right: 14px; font-family: var(--font-mono); }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="brand-title">
+      <h1>VENDYAI // SOVEREIGN PAYMENT FIELD</h1>
+      <p>Universal Payment-Provider Abstraction &bull; Zero Processor Lock-In</p>
+    </div>
+    <div class="badges-group">
+      <div class="badge badge-mint">V2 PROVIDER-NEUTRAL INTERFACE ACTIVE</div>
+      <div class="badge badge-sky">D1 LEDGER &bull; NO STRIPE OBJECT LEAK</div>
+    </div>
+  </header>
+
+  <div class="kpi-row">
+    <div class="kpi-card">
+      <div class="kpi-val">0%</div>
+      <div class="kpi-lbl">VendyAI Platform Fee (Zero-Tax)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-val">&lt;40ms</div>
+      <div class="kpi-lbl">Checkout Session Provisioning</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-val">vpr_</div>
+      <div class="kpi-lbl">Sovereign Price Reference Schema</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-val">100%</div>
+      <div class="kpi-lbl">Provider-Agnostic Webhooks</div>
+    </div>
+  </div>
+
+  <div class="main-grid">
+    <!-- Left: Checkout Configurator -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Sovereign Checkout Generator</h2>
+        <span>PRICE_REF MAPPING</span>
+      </div>
+
+      <div class="form-group">
+        <label>Consuming Venture ID</label>
+        <select class="form-select" id="ventureId" onchange="updateSimulatedCheckout()">
+          <option value="conseiv" selected>conseiv.com (AI CAD Studio)</option>
+          <option value="lawyik">lawyik.com (Subcontractor Redliner)</option>
+          <option value="mobleymetal">mobleymetal.com (Division 08 Hardware)</option>
+          <option value="weylandai">weylandai.com (SubX OCR Engine)</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label>VendyAI Price Reference (vpr_...)</label>
+        <input type="text" class="form-input" id="priceRef" value="vpr_b9224f87788d419f80fe9d6c18970bcf" oninput="updateSimulatedCheckout()">
+      </div>
+
+      <div class="form-group">
+        <label>Unit Amount (USD $)</label>
+        <input type="number" class="form-input" id="unitAmount" value="199.00" oninput="updateSimulatedCheckout()">
+      </div>
+
+      <button class="btn" onclick="simulatePayment()">
+        SIMULATE LIVE CHECKOUT DISPATCH &rarr;
+      </button>
+
+      <div style="margin-top:18px; font-size:0.8rem; font-family:var(--font-mono); color:var(--text-muted); line-height:1.6;">
+        <strong style="color:#fff;">Provider Isolation:</strong> Consuming ventures call <code>POST /api/v2/checkout/sessions</code> passing only <code>price_refs</code>. No Stripe keys, price IDs, or processor specifics ever touch venture codebases.
+      </div>
+    </div>
+
+    <!-- Right: Dispatched Neutral Webhook Inspector -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Dispatched Event Stream</h2>
+        <span style="color:var(--mint);" id="eventStatus">EVENT: PAYMENT.COMPLETED</span>
+      </div>
+
+      <div class="webhook-box">
+        <pre><code id="webhookJson">{
+  "event": "payment.completed",
+  "venture_id": "conseiv",
+  "external_reference": "vpay_8f912c0401",
+  "customer": {
+    "ref": "vcus_4892c90124",
+    "email": "machinist@fabrication-shop.com",
+    "name": "Alex Mercer"
+  },
+  "amount_total_cents": 19900,
+  "currency": "usd",
+  "provider_fee_cents": 607,
+  "net_cents": 19293,
+  "metadata": {
+    "product_id": "cad_waas_token",
+    "tier": "Tier 2 Supervised Wetware"
+  },
+  "occurred_at": "2026-09-29T04:42:00Z"
+}</code></pre>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <div>
+      <a href="https://mobleyreport.com">Mobley Report</a>
+      <a href="https://authfor.com">AuthFor Identity</a>
+      <a href="https://conseiv.com">Conseiv CAD</a>
+      <a href="https://fedbank.cc">FedBank</a>
+      <a href="https://hascom.org">Hascom Fleet</a>
+    </div>
+    <div>
+      VENDYAI // Sovereign Payment Abstraction &bull; Richmond, VA
+    </div>
+  </footer>
+
+  <script>
+    function updateSimulatedCheckout() {
+      const venture = document.getElementById('ventureId').value;
+      const ref = document.getElementById('priceRef').value;
+      const amount = parseFloat(document.getElementById('unitAmount').value) || 0;
+      const cents = Math.round(amount * 100);
+      const fee = Math.round(cents * 0.029 + 30);
+      const net = Math.max(0, cents - fee);
+
+      const payload = {
+        event: "payment.completed",
+        venture_id: venture,
+        external_reference: "vpay_" + Math.random().toString(16).slice(2, 10),
+        customer: {
+          ref: "vcus_" + Math.random().toString(16).slice(2, 10),
+          email: "customer@" + venture + "-client.com",
+          name: "Verified Operator"
+        },
+        amount_total_cents: cents,
+        currency: "usd",
+        provider_fee_cents: fee,
+        net_cents: net,
+        metadata: {
+          price_ref: ref,
+          settlement_rail: "sovereign_internal_ach"
+        },
+        occurred_at: new Date().toISOString()
+      };
+
+      document.getElementById('webhookJson').innerText = JSON.stringify(payload, null, 2);
+    }
+
+    function simulatePayment() {
+      updateSimulatedCheckout();
+      document.getElementById('eventStatus').innerText = "DISPATCHED TO VENTURE WEBHOOK [HTTP 200]";
+      setTimeout(() => {
+        document.getElementById('eventStatus').innerText = "EVENT: PAYMENT.COMPLETED";
+      }, 3000);
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      updateSimulatedCheckout();
+    });
+  </script>
+</body>
+</html>
