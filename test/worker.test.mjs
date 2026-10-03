@@ -16,6 +16,8 @@ function makeEnv() {
 function fakeStripeFetch() {
   const calls = [];
   let seq = 0;
+  const createdProducts = {};
+  const createdPrices = {};
   const existingPrices = {
     price_existing_live: { id: "price_existing_live", active: true, unit_amount: 29900, currency: "usd", recurring: { interval: "month" } },
     price_existing_inactive: { id: "price_existing_inactive", active: false, unit_amount: 500, currency: "usd", recurring: null },
@@ -29,14 +31,30 @@ function fakeStripeFetch() {
       seq += 1;
       if (path.startsWith("/prices/") && (!opts.method || opts.method === "GET")) {
         const priceId = path.slice("/prices/".length);
-        const price = existingPrices[priceId];
+        const price = existingPrices[priceId] || createdPrices[priceId];
         return price ? jsonRes(price) : jsonRes({ error: { message: "No such price" } }, 404);
       }
       if (path === "/products") {
-        return jsonRes({ id: `prod_${seq}` });
+        const id = `prod_${seq}`;
+        createdProducts[id] = true;
+        return jsonRes({ id });
       }
       if (path === "/prices") {
-        return jsonRes({ id: `price_${seq}` });
+        const id = `price_${seq}`;
+        // Record what was actually created so a later GET /prices/<id> -
+        // e.g. create-sku's reuse path resolving product_id for a SKU
+        // created in an earlier call - reads back real fields instead of
+        // 404ing. Only the fields this worker actually reads are tracked.
+        const params = new URLSearchParams(bodyStr);
+        createdPrices[id] = {
+          id,
+          product: params.get("product"),
+          active: true,
+          unit_amount: Number(params.get("unit_amount")),
+          currency: params.get("currency"),
+          recurring: params.get("recurring[interval]") ? { interval: params.get("recurring[interval]") } : null,
+        };
+        return jsonRes({ id, product: params.get("product") });
       }
       if (path === "/checkout/sessions") {
         return jsonRes({ id: `cs_test_${seq}`, url: `https://checkout.stripe.com/c/pay/cs_test_${seq}`, status: "open", amount_total: 1999, currency: "usd" });
@@ -675,4 +693,182 @@ test("admin prune: rejected without the admin secret", async () => {
   const { env } = makeEnv();
   const res = await worker.fetch(req("/api/admin/prune-stale-sessions", { method: "POST" }), env);
   assert.equal(res.status, 401);
+});
+
+test("create-sku: rejected without the admin secret", async () => {
+  const { env } = makeEnv();
+  const res = await worker.fetch(
+    req("/api/admin/create-sku", {
+      method: "POST",
+      body: { venture_id: "bitdoggo", product_name: "Pro", price_cents: 999, interval: "month" },
+    }),
+    env
+  );
+  assert.equal(res.status, 401);
+});
+
+test("create-sku: rejected for an unregistered venture_id, before any Stripe call", async () => {
+  const { env } = makeEnv();
+  const stripe = fakeStripeFetch();
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = stripe.fetchImpl;
+  try {
+    const res = await worker.fetch(
+      req("/api/admin/create-sku", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "ghostventure", product_name: "Pro", price_cents: 999, interval: "month" },
+      }),
+      env
+    );
+    assert.equal(res.status, 404);
+    const data = await res.json();
+    assert.equal(data.error.code, "UNKNOWN_VENTURE");
+    assert.equal(stripe.calls.length, 0);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("create-sku: real use case - a $9.99/month 'Pro' SKU for bitdoggo creates a real Product+Price and returns raw ids ready for checkout", async () => {
+  const { env, products } = makeEnv();
+  const stripe = fakeStripeFetch();
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = stripe.fetchImpl;
+  try {
+    await worker.fetch(
+      req("/api/ventures/register", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "bitdoggo", webhook_url: "https://bitdoggo.com/hook", hmac_secret: "s3cret" },
+      }),
+      env
+    );
+    const res = await worker.fetch(
+      req("/api/admin/create-sku", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "bitdoggo", product_name: "Pro", price_cents: 999, interval: "month" },
+      }),
+      env
+    );
+    assert.equal(res.status, 201);
+    const data = await res.json();
+    assert.ok(data.product_id.startsWith("prod_"));
+    assert.ok(data.price_id.startsWith("price_"));
+    assert.equal(data.mode, "subscription");
+    assert.equal(products.length, 1, "the new SKU lands in the same catalog table /api/v2/products reads");
+    assert.equal(products[0].venture_id, "bitdoggo");
+    assert.equal(products[0].unit_amount_cents, 999);
+    assert.equal(products[0].recurring_interval, "month");
+
+    const priceCall = stripe.calls.find((c) => c.path === "/prices");
+    assert.ok(priceCall.bodyStr.includes("unit_amount=999"));
+    assert.ok(priceCall.bodyStr.includes("recurring%5Binterval%5D=month"));
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("create-sku: a one-time price omits recurring and returns mode 'payment'", async () => {
+  const { env } = makeEnv();
+  const stripe = fakeStripeFetch();
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = stripe.fetchImpl;
+  try {
+    await worker.fetch(
+      req("/api/ventures/register", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "selfcoin", webhook_url: "https://selfcoin.cc/hook", hmac_secret: "s3cret" },
+      }),
+      env
+    );
+    const res = await worker.fetch(
+      req("/api/admin/create-sku", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "selfcoin", product_name: "Custom Tokenomics Setup", price_cents: 5000, interval: "one_time" },
+      }),
+      env
+    );
+    assert.equal(res.status, 201);
+    const data = await res.json();
+    assert.equal(data.mode, "payment");
+    const priceCall = stripe.calls.find((c) => c.path === "/prices");
+    assert.ok(!priceCall.bodyStr.includes("recurring"));
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("create-sku: calling it twice for the same (venture_id, product_name) reuses the existing Stripe Product+Price instead of minting a duplicate", async () => {
+  const { env, products } = makeEnv();
+  const stripe = fakeStripeFetch();
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = stripe.fetchImpl;
+  try {
+    await worker.fetch(
+      req("/api/ventures/register", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "bitdoggo", webhook_url: "https://bitdoggo.com/hook", hmac_secret: "s3cret" },
+      }),
+      env
+    );
+    const first = await worker.fetch(
+      req("/api/admin/create-sku", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "bitdoggo", product_name: "Pro", price_cents: 999, interval: "month" },
+      }),
+      env
+    );
+    const firstData = await first.json();
+
+    const second = await worker.fetch(
+      req("/api/admin/create-sku", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "bitdoggo", product_name: "Pro", price_cents: 999, interval: "month" },
+      }),
+      env
+    );
+    assert.equal(second.status, 200, "a repeat create-sku call is a reuse (200), not a new creation (201)");
+    const secondData = await second.json();
+    assert.equal(secondData.product_id, firstData.product_id);
+    assert.equal(secondData.price_id, firstData.price_id);
+    assert.equal(secondData.reused, true);
+    assert.equal(products.length, 1, "no second product row was inserted");
+    assert.equal(
+      stripe.calls.filter((c) => c.path === "/products" || c.path === "/prices").length,
+      2,
+      "the first call mints exactly one real Stripe Product + one Price; the second call must mint none"
+    );
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("create-sku: an invalid interval is rejected before any Stripe call", async () => {
+  const { env } = makeEnv();
+  const stripe = fakeStripeFetch();
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = stripe.fetchImpl;
+  try {
+    const res = await worker.fetch(
+      req("/api/admin/create-sku", {
+        method: "POST",
+        headers: { "X-Admin-Secret": ADMIN_SECRET },
+        body: { venture_id: "bitdoggo", product_name: "Pro", price_cents: 999, interval: "yearly" },
+      }),
+      env
+    );
+    assert.equal(res.status, 400);
+    const data = await res.json();
+    assert.equal(data.error.code, "VALIDATION_ERROR");
+    assert.equal(stripe.calls.length, 0);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
 });

@@ -66,6 +66,17 @@ export function fakeD1() {
                 Object.assign(row, { status: "completed", stripe_customer_id });
                 return { api_version: row.api_version || "v1" };
               }
+              // Two different real queries share the "SELECT provider_price_id
+              // FROM products" prefix with different WHERE clauses (and
+              // different bind-arg order) - /api/v2/checkout/sessions looks
+              // up by (id, venture_id), /api/admin/create-sku's dedupe check
+              // looks up by (venture_id, name). Matched on the full WHERE
+              // clause, not just the shared prefix, so they can't collide.
+              if (sql.startsWith("SELECT provider_price_id FROM products WHERE venture_id = ? AND name = ?")) {
+                const [ventureId, name] = args;
+                const p = products.find((p) => p.venture_id === ventureId && p.name === name && p.active === 1);
+                return p ? { provider_price_id: p.provider_price_id } : null;
+              }
               if (sql.startsWith("SELECT provider_price_id FROM products")) {
                 const [priceRef, ventureId] = args;
                 const p = products.find((p) => p.id === priceRef && p.venture_id === ventureId && p.active === 1);

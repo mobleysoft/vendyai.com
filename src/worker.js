@@ -567,6 +567,80 @@ export default {
       }
     }
 
+    // Internal admin SKU provisioning - built so another venture's Worker
+    // (or an agent/session acting on its behalf) can request "create a
+    // $X/month (or one-time $X) SKU called Y for venture Z" and get back a
+    // real, usable Stripe Price ID to wire directly into a checkout flow,
+    // instead of every venture hand-rolling its own Stripe Product/Price
+    // API calls. Deliberately returns raw Stripe ids (unlike /api/v2/
+    // products' price_ref abstraction above) because the whole point here
+    // is a ready-to-use id a caller can drop straight into
+    // /api/checkout/sessions' line_items[].price today. Same admin-secret
+    // gate, same venture-must-be-registered check, and the same
+    // dedupe-by-(venture_id, name) products table as /api/v2/products
+    // above - this is a second entry point onto that one real catalog, not
+    // a parallel one, so a SKU created here is also visible via GET
+    // /api/v2/products and can't be double-minted by calling either route
+    // twice.
+    if (url.pathname === "/api/admin/create-sku" && request.method === "POST") {
+      const adminSecret = request.headers.get("X-Admin-Secret");
+      if (!env.ADMIN_SECRET || adminSecret !== env.ADMIN_SECRET) {
+        return errorResponse("UNAUTHORIZED", "invalid admin secret", 401);
+      }
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return errorResponse("INVALID_JSON", "invalid JSON body");
+      }
+      const { venture_id, product_name, price_cents, interval } = body || {};
+      if (!venture_id || !product_name || !Number.isInteger(price_cents) || price_cents <= 0) {
+        return errorResponse("VALIDATION_ERROR", "venture_id, product_name, and a positive integer price_cents are required");
+      }
+      if (interval !== undefined && interval !== "month" && interval !== "one_time") {
+        return errorResponse("VALIDATION_ERROR", 'interval must be "month" or "one_time" when provided');
+      }
+      const recurringInterval = interval === "month" ? "month" : null;
+      const mode = recurringInterval ? "subscription" : "payment";
+
+      const registration = await env.DB.prepare(
+        "SELECT venture_id FROM venture_webhook_endpoints WHERE venture_id = ?"
+      ).bind(venture_id).first();
+      if (!registration) {
+        return errorResponse("UNKNOWN_VENTURE", `venture_id "${venture_id}" is not registered - see POST /api/ventures/register`, 404);
+      }
+
+      // Same idempotency rule as /api/v2/products' 2026-09-26 fix: never
+      // mint a second Stripe Product+Price for a (venture_id, name) pair
+      // that already has one, whichever route created it first.
+      const existing = await env.DB.prepare(
+        "SELECT provider_price_id FROM products WHERE venture_id = ? AND name = ? AND active = 1"
+      ).bind(venture_id, product_name).first();
+      if (existing) {
+        try {
+          const price = await stripeRequest(env, "GET", `/prices/${existing.provider_price_id}`);
+          return jsonResponse({ product_id: price.product, price_id: price.id, mode, reused: true }, 200);
+        } catch (err) {
+          return errorResponse("STRIPE_ERROR", err.message, 502);
+        }
+      }
+
+      try {
+        const product = await stripeRequest(env, "POST", "/products", { name: product_name });
+        const priceBody = { product: product.id, unit_amount: price_cents, currency: "usd" };
+        if (recurringInterval) priceBody.recurring = { interval: recurringInterval };
+        const price = await stripeRequest(env, "POST", "/prices", priceBody);
+        const priceRef = `vpr_${crypto.randomUUID().replace(/-/g, "")}`;
+        await env.DB.prepare(
+          "INSERT INTO products (id, venture_id, name, description, unit_amount_cents, currency, recurring_interval, provider_price_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        ).bind(priceRef, venture_id, product_name, null, price_cents, "usd", recurringInterval, price.id).run();
+        return jsonResponse({ product_id: product.id, price_id: price.id, mode }, 201);
+      } catch (err) {
+        console.error("[vendyai] create-sku failed:", err.message);
+        return errorResponse("STRIPE_ERROR", err.message, 502);
+      }
+    }
+
     // Lists a venture's own active catalog - a venture only ever needs to
     // know its own price_refs, never another venture's.
     if (url.pathname === "/api/v2/products" && request.method === "GET") {
