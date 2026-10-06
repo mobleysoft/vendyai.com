@@ -521,12 +521,13 @@ test("webhook: v1 session forwards the legacy Stripe-shaped payload, byte-for-by
   const { env, sessions } = makeEnv();
   env.STRIPE_WEBHOOK_SECRET = "whsec_test";
   const forwardCalls = [];
+  let forwardStatus = 200;
   const origFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts) => {
     const href = typeof url === "string" ? url : url.toString();
     if (href === "https://weylandai.com/hook") {
       forwardCalls.push(JSON.parse(opts.body));
-      return jsonRes({ ok: true });
+      return jsonRes({ ok: forwardStatus === 200 }, forwardStatus);
     }
     if (href.startsWith("https://mobcoin.cc/api/mobcoin/ledger")) {
       return jsonRes({ ok: true, id: "entry_1" }, 201);
@@ -579,6 +580,16 @@ test("webhook: v1 session forwards the legacy Stripe-shaped payload, byte-for-by
     assert.equal(forwardCalls[0].data.customer, "cus_v1");
     assert.equal(forwardCalls[0].data.stripe_fee_cents, 10);
     assert.equal(forwardCalls[0].data.net_to_venture_cents, 90);
+    assert.equal((await res.json()).forwarded.forwarded, true);
+
+    forwardStatus = 500;
+    const failed = await worker.fetch(new Request("https://vendyai.com/api/stripe/webhook", {
+      method: "POST", headers: { "Stripe-Signature": `t=${timestamp},v1=${signature}` }, body: payload,
+    }), env);
+    const failure = await failed.json();
+    assert.equal(failure.forwarded.forwarded, false);
+    assert.equal(failure.forwarded.status, 500);
+    assert.equal(failure.forwarded.reason, "consumer_http_error");
   } finally {
     globalThis.fetch = origFetch;
   }

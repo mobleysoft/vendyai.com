@@ -227,7 +227,9 @@ async function forwardToVenture(env, ventureId, payload) {
       },
       body,
     });
-    return { forwarded: true, status: res.status };
+    return res.ok
+      ? { forwarded: true, status: res.status }
+      : { forwarded: false, status: res.status, reason: "consumer_http_error" };
   } catch (err) {
     console.error(`[vendyai] forward to ${ventureId} failed:`, err.message);
     return { forwarded: false, reason: err.message };
