@@ -55,6 +55,11 @@ export function fakeD1() {
                 const v = ventures.find((v) => v.venture_id === args[0]);
                 return v ? { webhook_url: v.webhook_url, hmac_secret: v.hmac_secret } : null;
               }
+              if (sql.startsWith("SELECT venture_id FROM checkout_sessions WHERE stripe_customer_id = ? AND status = 'completed'")) {
+                const matches = sessions.filter((s) => s.stripe_customer_id === args[0] && s.status === "completed");
+                const s = matches.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))[0];
+                return s ? { venture_id: s.venture_id } : null;
+              }
               if (sql.startsWith("SELECT venture_id, status, amount_total, currency FROM checkout_sessions")) {
                 const s = sessions.find((s) => s.stripe_session_id === args[0]);
                 return s ? { venture_id: s.venture_id, status: s.status, amount_total: s.amount_total, currency: s.currency } : null;

@@ -236,6 +236,82 @@ async function forwardToVenture(env, ventureId, payload) {
   }
 }
 
+// 2026-10-07: subscription lifecycle forwarding. Until now only completed
+// checkouts reached a venture, so a cancelled or lapsed subscriber kept what
+// they had bought. These Stripe events are forwarded, in the v1 shape
+// { id, type, created, data: <the Stripe object, trimmed> }, to the ventures
+// listed here (each one's handler has to apply them; weylandai's does:
+// weylandai.com weyland-platform-worker/src/routes/webhooks-subscription.js).
+// The venture is read from the subscription's own metadata (vendyai and
+// weylandai's embedded checkout put venture_id there), else from the
+// completed checkout this customer made through vendyai.
+const LIFECYCLE_EVENT_TYPES = new Set([
+  "customer.subscription.updated",
+  "customer.subscription.deleted",
+  "invoice.payment_failed",
+  "invoice.paid",
+]);
+const LIFECYCLE_FORWARD_VENTURES = new Set(["weylandai"]);
+
+// A Stripe reference that may be an id string or an expanded object.
+function idOf(p) {
+  return typeof p === "string" ? p : p?.id || null;
+}
+
+// Only what a venture needs to apply the event (no addresses, no payment details).
+function trimSubscription(sub) {
+  return {
+    id: sub.id,
+    object: "subscription",
+    customer: typeof sub.customer === "string" ? sub.customer : sub.customer?.id || null,
+    status: sub.status,
+    cancel_at_period_end: sub.cancel_at_period_end ?? null,
+    canceled_at: sub.canceled_at ?? null,
+    current_period_end: sub.current_period_end ?? null,
+    metadata: sub.metadata || {},
+    items: {
+      data: (sub.items?.data || []).map((it) => ({ quantity: it.quantity ?? 1, price: { id: idOf(it.price) || idOf(it.plan) } })),
+    },
+  };
+}
+
+function trimInvoice(inv) {
+  const parentSub = inv.parent?.subscription_details || null;
+  return {
+    id: inv.id,
+    object: "invoice",
+    customer: typeof inv.customer === "string" ? inv.customer : inv.customer?.id || null,
+    status: inv.status ?? null,
+    billing_reason: inv.billing_reason ?? null,
+    subscription: idOf(inv.subscription) || idOf(parentSub?.subscription) || null,
+    subscription_details: { metadata: inv.subscription_details?.metadata || parentSub?.metadata || {} },
+    lines: {
+      data: (inv.lines?.data || []).map((ln) => ({
+        type: ln.type ?? null,
+        subscription: idOf(ln.subscription) || idOf(ln.parent?.subscription_item_details?.subscription) || null,
+        quantity: ln.quantity ?? 1,
+        price: { id: idOf(ln.price) || idOf(ln.pricing?.price_details?.price) || idOf(ln.plan) },
+        metadata: ln.metadata || {},
+      })),
+    },
+  };
+}
+
+async function lifecycleVentureId(env, type, obj) {
+  const fromMetadata = type.startsWith("invoice.")
+    ? obj.subscription_details?.metadata?.venture_id ||
+      obj.parent?.subscription_details?.metadata?.venture_id ||
+      (obj.lines?.data || []).map((ln) => ln.metadata?.venture_id).find(Boolean)
+    : obj.metadata?.venture_id;
+  if (fromMetadata) return fromMetadata;
+  const customer = typeof obj.customer === "string" ? obj.customer : obj.customer?.id;
+  if (!customer) return null;
+  const row = await env.DB.prepare(
+    "SELECT venture_id FROM checkout_sessions WHERE stripe_customer_id = ? AND status = 'completed' ORDER BY created_at DESC LIMIT 1"
+  ).bind(customer).first();
+  return row?.venture_id || null;
+}
+
 export default {
   // Daily Cloudflare Cron Trigger (see wrangler.toml [triggers]) - real
   // scheduled cleanup, not just a callable-on-demand function nobody calls.
@@ -272,7 +348,7 @@ export default {
       } catch {
         return errorResponse("INVALID_JSON", "invalid JSON body");
       }
-      const { venture_id, mode, customer_email, success_url, cancel_url, line_items, metadata } = body || {};
+      const { venture_id, mode, customer_email, client_reference_id, success_url, cancel_url, line_items, metadata } = body || {};
       if (!venture_id || !success_url || !cancel_url || !Array.isArray(line_items) || line_items.length === 0) {
         return errorResponse("VALIDATION_ERROR", "venture_id, success_url, cancel_url, and a non-empty line_items array are required");
       }
@@ -286,10 +362,15 @@ export default {
         const session = await stripeRequest(env, "POST", "/checkout/sessions", {
           mode: mode || "payment",
           customer_email,
+          // 2026-10-07: the caller's own account id for the buyer (Stripe hands it back on
+          // the completed session), and the venture on the subscription itself, so its later
+          // events (renewals, failed payments, cancellation) can be routed to the venture.
+          client_reference_id: typeof client_reference_id === "string" && client_reference_id ? client_reference_id.slice(0, 200) : undefined,
           success_url,
           cancel_url,
           line_items,
           metadata: { ...metadata, venture_id },
+          subscription_data: mode === "subscription" ? { metadata: { ...metadata, venture_id } } : undefined,
         });
         await env.DB.prepare(
           "INSERT INTO checkout_sessions (id, venture_id, stripe_session_id, status, amount_total, currency) VALUES (?, ?, ?, ?, ?, ?)"
@@ -426,7 +507,7 @@ export default {
               // Legacy v1 shape - field names deliberately mirror Stripe's
               // own checkout.session object (id, customer, mode,
               // customer_details) so weylandai's existing webhook handler
-              // needs zero changes. Unchanged from before this pass.
+              // needs zero changes.
               type: "checkout.session.completed",
               data: {
                 id: session.id,
@@ -440,12 +521,50 @@ export default {
                 net_to_venture_cents: netCents,
               },
             };
+        // 2026-10-07, ventures that apply lifecycle events (weylandai): the
+        // Stripe event id and time (so the venture can drop a redelivery and
+        // order events), the subscription id (so a later cancellation can be
+        // matched to this purchase) and the buyer's account id, if it passed one.
+        const lifecycleConsumer = LIFECYCLE_FORWARD_VENTURES.has(ventureId);
+        if (lifecycleConsumer && apiVersion !== "v2") {
+          forwardPayload.id = event.id || null;
+          forwardPayload.created = event.created ?? null;
+          forwardPayload.data.subscription = typeof session.subscription === "string" ? session.subscription : session.subscription?.id || null;
+          forwardPayload.data.client_reference_id = session.client_reference_id || null;
+          forwardPayload.data.customer_email = session.customer_email || null;
+        }
         const forward = await forwardToVenture(env, ventureId, forwardPayload);
+        if (lifecycleConsumer && !forward.forwarded && forward.reason !== "unregistered_venture") {
+          // Not delivered: answer Stripe with an error so it redelivers (it retries for
+          // days); the venture drops any copy it already applied. The settlement entry
+          // waits for the delivery that succeeds, so a retry cannot post it twice.
+          console.error(`[vendyai] ${event.type} ${session.id} not delivered to ${ventureId} - asking Stripe to retry`);
+          return jsonResponse({ received: false, forwarded: forward, retry: true }, 503);
+        }
         const ledgerUnits = netCents ?? session.amount_total ?? null;
         const mobcoinLedger = ledgerUnits != null
           ? await postMobcoinLedgerEntry(env, ventureId, ledgerUnits, session.id)
           : { posted: false, reason: "no_amount" };
         return jsonResponse({ received: true, forwarded: forward, stripe_fee_cents: feeCents, net_to_venture_cents: netCents, mobcoin_ledger: mobcoinLedger });
+      }
+
+      if (LIFECYCLE_EVENT_TYPES.has(event.type)) {
+        const object = event.data?.object || {};
+        const lifecycleVenture = await lifecycleVentureId(env, event.type, object);
+        if (!lifecycleVenture || !LIFECYCLE_FORWARD_VENTURES.has(lifecycleVenture)) {
+          return jsonResponse({ received: true, forwarded: false, reason: lifecycleVenture ? "venture_not_subscribed_to_lifecycle_events" : "no_venture" });
+        }
+        const forward = await forwardToVenture(env, lifecycleVenture, {
+          id: event.id || null,
+          type: event.type,
+          created: event.created ?? null,
+          data: event.type.startsWith("invoice.") ? trimInvoice(object) : trimSubscription(object),
+        });
+        if (!forward.forwarded && forward.reason !== "unregistered_venture") {
+          console.error(`[vendyai] ${event.type} ${event.id} not delivered to ${lifecycleVenture} - asking Stripe to retry`);
+          return jsonResponse({ received: false, forwarded: forward, retry: true }, 503);
+        }
+        return jsonResponse({ received: true, forwarded: forward });
       }
 
       return jsonResponse({ received: true, forwarded: false, reason: "unhandled_event_type_or_missing_venture_id" });
@@ -703,6 +822,7 @@ export default {
           cancel_url,
           line_items: lineItems,
           metadata: { ...metadata, venture_id },
+          subscription_data: mode === "subscription" ? { metadata: { ...metadata, venture_id } } : undefined,
         });
         await env.DB.prepare(
           "INSERT INTO checkout_sessions (id, venture_id, stripe_session_id, status, amount_total, currency, api_version) VALUES (?, ?, ?, ?, ?, ?, 'v2')"

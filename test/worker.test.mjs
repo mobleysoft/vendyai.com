@@ -344,6 +344,9 @@ test("webhook: a completed checkout posts a real settlement entry to mobcoin.cc'
   const origFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts) => {
     const href = typeof url === "string" ? url : url.toString();
+    // The venture receives the forward (2026-10-07: for weylandai a failed
+    // delivery now asks Stripe to retry and holds the settlement entry back).
+    if (href === "https://weylandai.com/hook") return jsonRes({ received: true });
     if (href.startsWith("https://mobcoin.cc/api/mobcoin/ledger")) {
       mobcoinCalls.push({ url: href, headers: opts.headers, body: JSON.parse(opts.body) });
       return jsonRes({ ok: true, id: "entry_1" }, 201);
@@ -428,6 +431,9 @@ test("webhook: an out-of-range settlement amount is skipped, not posted, to mobc
   const origFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts) => {
     const href = typeof url === "string" ? url : url.toString();
+    // The venture receives the forward (2026-10-07: for weylandai a failed
+    // delivery now asks Stripe to retry and holds the settlement entry back).
+    if (href === "https://weylandai.com/hook") return jsonRes({ received: true });
     if (href.startsWith("https://mobcoin.cc/api/mobcoin/ledger")) {
       mobcoinCalls.push({ url: href, body: JSON.parse(opts.body) });
       return jsonRes({ ok: true }, 201);
@@ -517,7 +523,7 @@ test("v1: existing /api/checkout/sessions contract is completely unaffected by t
   }
 });
 
-test("webhook: v1 session forwards the legacy Stripe-shaped payload, byte-for-byte unchanged", async () => {
+test("webhook: v1 session forwards the legacy Stripe-shaped payload (weylandai also gets the event id/time, subscription and buyer since 2026-10-07; see lifecycle.test.mjs)", async () => {
   const { env, sessions } = makeEnv();
   env.STRIPE_WEBHOOK_SECRET = "whsec_test";
   const forwardCalls = [];
